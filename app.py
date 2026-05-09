@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from src.metrics import (  # noqa: E402
     enrich_triplet_dataframe,
+    gain_row_highlight_styler,
     stock_success_rate_percent,
     ui_triplet_columns,
 )
@@ -104,6 +105,7 @@ def _analyze_single_stock(
         "chunks": 0,
         "full_df": pd.DataFrame(),
         "display_df": pd.DataFrame(),
+        "n_gain_ge_threshold": 0,
         "enriched_candles": pd.DataFrame(),
         "success_pct": 0.0,
         "n_pairs": 0,
@@ -139,12 +141,12 @@ def _analyze_single_stock(
     out["n_pairs"] = n
     out["m_strict_gt"] = m
 
-    disp = trip_df.loc[
-        trip_df["gain_percentage"].notna() & (trip_df["gain_percentage"] >= max_gain_pct)
-    ].copy()
+    gp = trip_df["gain_percentage"]
+    out["n_gain_ge_threshold"] = int((gp.notna() & (gp >= float(max_gain_pct))).sum())
+
     out["full_df"] = trip_df
-    out["display_df"] = disp
-    out["show"] = bool(len(disp) > 0 and success >= success_min_pct)
+    out["display_df"] = trip_df.copy()
+    out["show"] = bool(n > 0 and success >= success_min_pct)
     return out
 
 
@@ -155,8 +157,8 @@ def main() -> None:
     st.markdown(
         "Batch mode: analyzes **every Nifty 500 symbol** (or your **override** list), "
         "pulls **Yahoo Finance** candles using **chunked** intraday requests, computes **RSI**, "
-        "then keeps rows with **gain % ≥ your minimum** and only shows stocks whose "
-        "**success rate** clears your filter."
+        "and shows **every excursion row** for stocks whose **success rate** clears your filter. "
+        "Rows with **gain % ≥ max gain %** are **highlighted** in the table."
     )
 
     with st.sidebar:
@@ -194,12 +196,13 @@ def main() -> None:
         )
         rsi_period = st.number_input("RSI period (bars)", min_value=2, max_value=50, value=14)
         max_gain_pct = st.number_input(
-            "Minimum gain % (table rows)",
+            "Max gain % (highlight threshold)",
             min_value=-1000.0,
             max_value=1000.0,
             value=0.0,
             step=0.1,
-            help="Keep excursion rows where gain_percentage = (max_peak - first_max)/first_max*100 is ≥ this value.",
+            help="Rows with gain_percentage ≥ this value are highlighted. "
+            "Same value is used inside success-rate M = count(gain% > this).",
         )
         success_min_pct = st.number_input(
             "Minimum stock success rate %",
@@ -207,8 +210,8 @@ def main() -> None:
             max_value=100.0,
             value=0.0,
             step=0.1,
-            help="Stock is shown only if success rate ≥ this AND it has ≥1 qualifying row. "
-            "Success % = ((N − M) / N)×100 with N=all excursions, M=count with gain% > minimum gain %.",
+            help="Show the full excursion table for a stock only if its success rate ≥ this. "
+            "Success % = ((N − M) / N)×100 with N=all excursions, M=count with gain% > max gain %.",
         )
         workers = st.slider(
             "Parallel download workers",
@@ -276,8 +279,8 @@ def main() -> None:
     with tab1:
         if not shown:
             st.warning(
-                "No stocks matched both filters (qualifying rows + success rate). "
-                "Try lowering minimum gain % or success rate, or shorten the window."
+                "No stocks met the minimum success rate (with at least one completed excursion). "
+                "Try lowering the success rate threshold or adjusting dates / RSI settings."
             )
         else:
             shown.sort(key=lambda x: x["symbol"])
@@ -291,14 +294,23 @@ def main() -> None:
                 st.subheader(sym)
                 st.caption(
                     f"Yahoo: **{r.get('interval')}** · chunks **{r.get('chunks', 0)}** · "
-                    f"success **{r['success_pct']:.2f}%** (N={r['n_pairs']}, M={r['m_strict_gt']}) "
-                    f"· qualifying rows **{len(disp)}**"
+                    f"success **{r['success_pct']:.2f}%** (N={r['n_pairs']}, M={r['m_strict_gt']}) · "
+                    f"highlighted rows (gain % ≥ max gain %): **{r.get('n_gain_ge_threshold', 0)}** / "
+                    f"**{len(disp)}** total"
                 )
                 if r.get("warning"):
                     st.warning(r["warning"])
 
                 ui_df = ui_triplet_columns(disp)
-                st.dataframe(ui_df, use_container_width=True, hide_index=True)
+                if ui_df.empty:
+                    st.caption("No excursion rows.")
+                else:
+                    st.caption("Highlighted rows meet **gain % ≥ max gain %**.")
+                    st.dataframe(
+                        gain_row_highlight_styler(ui_df, float(max_gain_pct)),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
                 st.download_button(
                     f"Download CSV — {sym}",
                     data=ui_df.to_csv(index=False).encode("utf-8"),
@@ -313,7 +325,7 @@ def main() -> None:
                 st.download_button(
                     "Download combined CSV (all shown stocks)",
                     data=merged.to_csv(index=False).encode("utf-8"),
-                    file_name=f"nifty500_rsi_filtered_{start_d}_{end_d}.csv",
+                    file_name=f"nifty500_rsi_excursions_{start_d}_{end_d}.csv",
                     mime="text/csv",
                     key="dl_merged",
                 )
@@ -382,12 +394,13 @@ def main() -> None:
 
 **Filters**
 
-- A row appears only if **gain_percentage ≥ minimum gain %** (sidebar).
-- A stock’s table is shown only if it has **≥1** such row **and**
-  **success rate % ≥ minimum success rate %**, where  
+- For each stock, **every** completed excursion row is listed once the stock’s **success rate** clears your minimum.
+- Rows with **gain_percentage ≥ max gain %** are **highlighted** (amber) in the UI; CSV downloads include all rows without cell colors.
+- **Success rate %** for showing a stock:  
   **N** = all completed excursions for that symbol,  
-  **M** = excursions with **gain_percentage > minimum gain %** (strict),  
-  **success %** = `((N − M) / N) × 100`.
+  **M** = excursions with **gain_percentage > max gain %** (strict),  
+  **success %** = `((N − M) / N) × 100`.  
+  The stock table appears only if **success % ≥ minimum success rate %** and **N ≥ 1**.
 
 **UI**
 

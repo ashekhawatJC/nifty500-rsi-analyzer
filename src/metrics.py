@@ -72,3 +72,23 @@ def ui_triplet_columns(df: pd.DataFrame) -> pd.DataFrame:
         if c.startswith("last_")
     ]
     return df.drop(columns=drop, errors="ignore")
+
+
+def gain_row_highlight_styler(ui_df: pd.DataFrame, gain_threshold: float) -> pd.io.formats.style.Styler:
+    """
+    Highlight entire rows where gain_percentage >= gain_threshold (non-NaN values only).
+    """
+    thr = float(gain_threshold)
+
+    def _row_styles(row: pd.Series) -> list[str]:
+        if "gain_percentage" not in row.index:
+            return [""] * len(row)
+        v = row["gain_percentage"]
+        try:
+            ok = pd.notna(v) and float(v) >= thr
+        except (TypeError, ValueError):
+            ok = False
+        cell = "background-color: #fff3cd; font-weight: 600" if ok else ""
+        return [cell] * len(row)
+
+    return ui_df.style.apply(_row_styles, axis=1)
