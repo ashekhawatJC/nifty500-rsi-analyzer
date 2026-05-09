@@ -82,6 +82,17 @@ def _chunk_span_days(interval_mins: int) -> int:
     return 55
 
 
+def _effective_chunk_span_days(interval_mins: int, multiplier: float) -> int:
+    """Scale base chunk length (fewer HTTP calls when multiplier > 1, capped for safety)."""
+    m = max(1.0, min(float(multiplier), 2.5))
+    scaled = max(1, int(_chunk_span_days(interval_mins) * m))
+    if interval_mins == 1:
+        return min(scaled, 7)
+    if interval_mins in (2, 5, 15, 30):
+        return min(scaled, 59)
+    return min(scaled, 270)
+
+
 def _is_rate_limited(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return (
@@ -169,6 +180,7 @@ def fetch_ohlcv(
     inter_chunk_delay_sec: float = 0.35,
     rate_limit_retries: int = 6,
     rate_limit_base_delay_sec: float = 2.0,
+    chunk_day_multiplier: float = 1.0,
 ) -> Tuple[pd.DataFrame, FetchMeta]:
     """
     OHLCV indexed by candle start. For 240m, downloads 60m (chunked) then resamples.
@@ -178,10 +190,18 @@ def fetch_ohlcv(
 
     ``inter_chunk_delay_sec`` adds a short pause between chunk HTTP calls (reduces 429s).
     ``rate_limit_*`` controls retries with backoff when Yahoo returns rate limits.
+    ``chunk_day_multiplier`` > 1 uses wider calendar windows (fewer HTTP calls, slightly
+    higher truncation risk on long intraday ranges).
     """
     warn = validate_intraday_range(start, end, interval_mins)
+    if float(chunk_day_multiplier) > 1.01:
+        note = (
+            f"Larger Yahoo chunk windows (×{float(chunk_day_multiplier):.2f}); fewer API calls, "
+            "slightly higher truncation risk on long intraday spans."
+        )
+        warn = f"{warn} {note}" if warn else note
     yf_iv = minutes_to_yf_interval(interval_mins)
-    span = _chunk_span_days(interval_mins)
+    span = _effective_chunk_span_days(interval_mins, chunk_day_multiplier)
     windows = _calendar_chunks(start, end, span)
 
     parts: List[pd.DataFrame] = []

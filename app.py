@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -83,6 +84,31 @@ def _ensure_access() -> None:
     st.stop()
 
 
+@st.cache_data(ttl=7200, max_entries=5000, show_spinner=False)
+def _cached_fetch_ohlcv(
+    symbol: str,
+    start_d: date,
+    end_d: date,
+    interval_mins: int,
+    inter_chunk_delay_sec: float,
+    rate_limit_retries: int,
+    rate_limit_base_delay_sec: float,
+    chunk_day_multiplier: float,
+) -> tuple[pd.DataFrame, str, str | None, int]:
+    """Disk-style cache for Yahoo OHLCV; repeat runs with same dates reuse data."""
+    df, meta = fetch_ohlcv(
+        symbol,
+        start_d,
+        end_d,
+        int(interval_mins),
+        inter_chunk_delay_sec=float(inter_chunk_delay_sec),
+        rate_limit_retries=int(rate_limit_retries),
+        rate_limit_base_delay_sec=float(rate_limit_base_delay_sec),
+        chunk_day_multiplier=float(chunk_day_multiplier),
+    )
+    return df, meta.interval, meta.warning, meta.chunks_fetched
+
+
 def _analyze_single_stock(
     symbol: str,
     start_d: date,
@@ -96,8 +122,9 @@ def _analyze_single_stock(
     fetch_inter_chunk_delay: float,
     fetch_rate_limit_retries: int,
     fetch_rate_limit_base_delay: float,
+    chunk_day_multiplier: float,
 ) -> dict:
-    """Fetch + RSI + triplets + filters (sequential Yahoo pacing in caller)."""
+    """Fetch + RSI + triplets + filters."""
     out: dict = {
         "symbol": symbol,
         "error": None,
@@ -114,18 +141,19 @@ def _analyze_single_stock(
         "show": False,
     }
     try:
-        df, meta = fetch_ohlcv(
+        df, interval, warn, chunks = _cached_fetch_ohlcv(
             symbol,
             start_d,
             end_d,
             int(candle_mins),
-            inter_chunk_delay_sec=float(fetch_inter_chunk_delay),
-            rate_limit_retries=int(fetch_rate_limit_retries),
-            rate_limit_base_delay_sec=float(fetch_rate_limit_base_delay),
+            float(fetch_inter_chunk_delay),
+            int(fetch_rate_limit_retries),
+            float(fetch_rate_limit_base_delay),
+            float(chunk_day_multiplier),
         )
-        out["warning"] = meta.warning
-        out["interval"] = meta.interval
-        out["chunks"] = meta.chunks_fetched
+        out["warning"] = warn
+        out["interval"] = interval
+        out["chunks"] = chunks
     except Exception as exc:  # noqa: BLE001
         out["error"] = str(exc)
         return out
@@ -245,23 +273,43 @@ def main() -> None:
             help="Show the full excursion table for a stock only if its success rate ≥ this. "
             "Success % = (M / N)×100 with N=all excursions, M=count with gain% > max gain %.",
         )
-        st.subheader("Yahoo pacing")
-        st.caption("Parallel workers were removed — Yahoo **429** throttling is much worse with bursts.")
+        st.subheader("Speed vs Yahoo limits")
+        st.caption(
+            "OHLCV is **cached ~2h** per symbol+dates — changing RSI / gain filters reuses downloads. "
+            "Use **2–4 concurrent** downloads to speed full batches; drop to **1** if you see 429s."
+        )
+        download_workers = st.slider(
+            "Concurrent symbol downloads",
+            min_value=1,
+            max_value=5,
+            value=3,
+            help="1 = slowest, gentlest on Yahoo. 3–4 is often ~3× faster for large lists; retry logic still applies.",
+        )
+        faster_chunks = st.checkbox(
+            "Fewer chunk requests per symbol (faster)",
+            value=False,
+            help="Larger calendar windows per Yahoo call = fewer HTTP requests per symbol. "
+            "Slightly higher risk of missing bars on very long intraday ranges.",
+        )
+        chunk_day_mult = 1.85 if faster_chunks else 1.0
+        if st.button("Clear Yahoo download cache", key="btn_clear_yahoo_cache"):
+            _cached_fetch_ohlcv.clear()
+            st.success("Download cache cleared — next run refetches from Yahoo.")
         symbol_pause_sec = st.slider(
-            "Pause between symbols (sec)",
+            "Pause between symbols (1 worker only) (sec)",
             min_value=0.0,
             max_value=5.0,
-            value=1.2,
-            step=0.1,
-            help="Wait after each symbol before the next HTTP sequence. Use ~1–2s for full Nifty 500.",
+            value=0.35,
+            step=0.05,
+            help="Ignored when concurrent downloads > 1. Adds space between back-to-back symbols for one worker.",
         )
         inter_chunk_sec = st.slider(
             "Pause between date chunks (sec)",
             min_value=0.0,
             max_value=2.0,
-            value=0.4,
-            step=0.05,
-            help="Extra delay between Yahoo `history()` calls for the same symbol (multi-chunk ranges).",
+            value=0.12,
+            step=0.02,
+            help="Delay between Yahoo chunk calls for the same symbol. Lower = faster; raise if 429s appear.",
         )
         rate_retries = st.number_input(
             "429 / rate-limit retries per request",
@@ -291,34 +339,48 @@ def main() -> None:
         return
 
     n_sym = len(symbols)
+    workers = max(1, min(int(download_workers), n_sym))
+    mode = f"**{workers}** concurrent download(s)" if workers > 1 else "**1** worker (sequential)"
     st.caption(
-        f"Analyzing **{n_sym}** symbol(s) **one at a time** with pacing (reduces Yahoo 429s). "
-        f"Intraday history uses **chunked** windows per symbol."
+        f"Analyzing **{n_sym}** symbol(s) — {mode}. "
+        f"OHLCV is **cached** for unchanged dates/symbol/chunk settings (~2h). "
+        f"Intraday uses **chunked** Yahoo windows."
     )
     prog = st.progress(0.0, text="Starting…")
     results: list[dict] = []
     done = 0
 
-    for i, sym in enumerate(symbols):
-        results.append(
-            _analyze_single_stock(
-                sym,
-                start_d,
-                end_d,
-                int(candle_mins),
-                float(threshold),
-                int(rsi_period),
-                float(max_gain_pct),
-                float(success_min_pct),
-                fetch_inter_chunk_delay=float(inter_chunk_sec),
-                fetch_rate_limit_retries=int(rate_retries),
-                fetch_rate_limit_base_delay=float(rate_base_delay),
-            )
+    def _one(sym: str) -> dict:
+        return _analyze_single_stock(
+            sym,
+            start_d,
+            end_d,
+            int(candle_mins),
+            float(threshold),
+            int(rsi_period),
+            float(max_gain_pct),
+            float(success_min_pct),
+            fetch_inter_chunk_delay=float(inter_chunk_sec),
+            fetch_rate_limit_retries=int(rate_retries),
+            fetch_rate_limit_base_delay=float(rate_base_delay),
+            chunk_day_multiplier=float(chunk_day_mult),
         )
-        done += 1
-        prog.progress(done / max(n_sym, 1), text=f"Completed {done}/{n_sym}…")
-        if float(symbol_pause_sec) > 0 and i < n_sym - 1:
-            time.sleep(float(symbol_pause_sec))
+
+    if workers == 1:
+        for i, sym in enumerate(symbols):
+            results.append(_one(sym))
+            done += 1
+            prog.progress(done / max(n_sym, 1), text=f"Completed {done}/{n_sym}…")
+            if float(symbol_pause_sec) > 0 and i < n_sym - 1:
+                time.sleep(float(symbol_pause_sec))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_to_sym = {ex.submit(_one, sym): sym for sym in symbols}
+            for fut in as_completed(future_to_sym):
+                results.append(fut.result())
+                done += 1
+                prog.progress(done / max(n_sym, 1), text=f"Completed {done}/{n_sym}…")
+        results.sort(key=lambda r: r["symbol"])
 
     prog.empty()
 
@@ -441,7 +503,7 @@ def main() -> None:
 - Each symbol’s intraday range is downloaded in **multiple calendar windows** (chunks), then merged.
 - This reduces **silent truncation** from asking Yahoo for one very long intraday span in a single call.
 - Yahoo can still omit data outside its published intraday depth; widen the interval or shorten dates if bars are missing.
-- **Rate limits (429):** symbols are fetched **sequentially** with pauses between symbols and between chunks; failed chunks **retry** with exponential backoff. For large batches, use **1–2 s** between symbols and avoid many parallel browser tabs hitting Yahoo at the same time.
+- **Rate limits (429):** use **2–4 concurrent** symbol downloads for speed, or **1** + pauses if Yahoo complains. Chunks **retry** with backoff. **OHLCV is cached** in the app (~2h) so re-runs that only change RSI / filters reuse downloads.
 
 **RSI excursions**
 
