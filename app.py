@@ -158,7 +158,7 @@ def main() -> None:
         "Batch mode: analyzes **every Nifty 500 symbol** (or your **override** list), "
         "pulls **Yahoo Finance** candles using **chunked** intraday requests, computes **RSI**, "
         "and shows **every excursion row** for stocks whose **success rate** clears your filter. "
-        "Rows with **gain % ≥ max gain %** are **highlighted** in the table."
+        "Rows with **gain % ≥ max gain %** use **dark green** text in the table (same row background as others)."
     )
 
     with st.sidebar:
@@ -201,7 +201,7 @@ def main() -> None:
             max_value=1000.0,
             value=0.0,
             step=0.1,
-            help="Rows with gain_percentage ≥ this value are highlighted. "
+            help="Rows with gain_percentage ≥ this value are shown in **dark green** text in the table.",
             "Same value is used inside success-rate M = count(gain% > this).",
         )
         success_min_pct = st.number_input(
@@ -295,7 +295,7 @@ def main() -> None:
                 st.caption(
                     f"Yahoo: **{r.get('interval')}** · chunks **{r.get('chunks', 0)}** · "
                     f"success **{r['success_pct']:.2f}%** (N={r['n_pairs']}, M={r['m_strict_gt']}) · "
-                    f"highlighted rows (gain % ≥ max gain %): **{r.get('n_gain_ge_threshold', 0)}** / "
+                    f"rows with gain % ≥ max (dark green text): **{r.get('n_gain_ge_threshold', 0)}** / "
                     f"**{len(disp)}** total"
                 )
                 if r.get("warning"):
@@ -305,7 +305,7 @@ def main() -> None:
                 if ui_df.empty:
                     st.caption("No excursion rows.")
                 else:
-                    st.caption("Highlighted rows meet **gain % ≥ max gain %**.")
+                    st.caption("Rows in **dark green** meet **gain % ≥ max gain %** (same background as other rows).")
                     st.dataframe(
                         gain_row_highlight_styler(ui_df, float(max_gain_pct)),
                         use_container_width=True,
@@ -395,7 +395,7 @@ def main() -> None:
 **Filters**
 
 - For each stock, **every** completed excursion row is listed once the stock’s **success rate** clears your minimum.
-- Rows with **gain_percentage ≥ max gain %** are **highlighted** (amber) in the UI; CSV downloads include all rows without cell colors.
+- Rows with **gain_percentage ≥ max gain %** are shown in **dark green** text in the UI (no row background change); CSV downloads have no cell colors.
 - **Success rate %** for showing a stock:  
   **N** = all completed excursions for that symbol,  
   **M** = excursions with **gain_percentage > max gain %** (strict),  

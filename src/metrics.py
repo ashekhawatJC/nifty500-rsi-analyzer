@@ -77,7 +77,8 @@ def ui_triplet_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def gain_row_highlight_styler(ui_df: pd.DataFrame, gain_threshold: float) -> pd.io.formats.style.Styler:
     """
-    Highlight entire rows where gain_percentage >= gain_threshold (non-NaN values only).
+    Emphasize rows where gain_percentage >= gain_threshold: dark green text only
+    (same background as other rows — avoids low-contrast filled cells in Streamlit).
     """
     thr = float(gain_threshold)
 
@@ -89,7 +90,8 @@ def gain_row_highlight_styler(ui_df: pd.DataFrame, gain_threshold: float) -> pd.
             ok = pd.notna(v) and float(v) >= thr
         except (TypeError, ValueError):
             ok = False
-        cell = "background-color: #fff3cd; font-weight: 600" if ok else ""
+        # Dark green readable on light Streamlit theme; no background override.
+        cell = "color: #065f46; font-weight: 600" if ok else ""
         return [cell] * len(row)
 
     return ui_df.style.apply(_row_styles, axis=1)
