@@ -211,7 +211,7 @@ def main() -> None:
             value=0.0,
             step=0.1,
             help="Show the full excursion table for a stock only if its success rate ≥ this. "
-            "Success % = ((N − M) / N)×100 with N=all excursions, M=count with gain% > max gain %.",
+            "Success % = (M / N)×100 with N=all excursions, M=count with gain% > max gain %.",
         )
         workers = st.slider(
             "Parallel download workers",
@@ -399,7 +399,7 @@ def main() -> None:
 - **Success rate %** for showing a stock:  
   **N** = all completed excursions for that symbol,  
   **M** = excursions with **gain_percentage > max gain %** (strict),  
-  **success %** = `((N − M) / N) × 100`.  
+  **success %** = `(M / N) × 100`.  
   The stock table appears only if **success % ≥ minimum success rate %** and **N ≥ 1**.
 
 **UI**

@@ -52,14 +52,15 @@ def stock_success_rate_percent(
 ) -> Tuple[float, int, int]:
     """
     Per stock: N = total excursions; M = excursions with gain% > max_gain_threshold (strict).
-    Returns ( ((N - M) / N) * 100 , N, M ). If N==0, returns (0.0, 0, 0).
+    Success % = (M / N) × 100 — share of excursions that strictly beat the gain threshold.
+    Returns (success_pct, N, M). If N==0, returns (0.0, 0, 0).
     """
     n = int(gain_percentages.shape[0])
     if n == 0:
         return 0.0, 0, 0
     thr = float(max_gain_threshold)
     m = int(((gain_percentages > thr) & gain_percentages.notna()).sum())
-    return ((n - m) / n) * 100.0, n, m
+    return (m / n) * 100.0, n, m
 
 
 def ui_triplet_columns(df: pd.DataFrame) -> pd.DataFrame:
