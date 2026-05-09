@@ -39,6 +39,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+STOCK_PICK_KEY = "nifty_stock_pick"
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def cached_nifty500_symbols() -> list[str]:
@@ -79,11 +81,6 @@ def _ensure_access() -> None:
         else:
             st.error("Incorrect password.")
     st.stop()
-
-
-def _parse_override_symbols(raw: str) -> list[str]:
-    parts = [p.strip().upper() for p in raw.replace(";", ",").split(",")]
-    return [p for p in parts if p]
 
 
 def _analyze_single_stock(
@@ -167,7 +164,7 @@ def main() -> None:
 
     st.title("Nifty 500 — RSI threshold excursion analyzer")
     st.markdown(
-        "Batch mode: analyzes **every Nifty 500 symbol** (or your **override** list), "
+        "Batch mode: analyzes **selected Nifty 500 symbols**, "
         "pulls **Yahoo Finance** candles using **chunked** intraday requests, computes **RSI**, "
         "and shows **every excursion row** for stocks whose **success rate** clears your filter. "
         "Rows with **gain % ≥ max gain %** use **dark green** text in the table (same row background as others)."
@@ -176,13 +173,34 @@ def main() -> None:
     with st.sidebar:
         st.header("Inputs")
         sym_list = cached_nifty500_symbols()
-        override_raw = st.text_input(
-            "Override Yahoo symbol(s) (optional)",
-            placeholder="One ticker or comma-separated, e.g. RELIANCE.NS, TCS.NS",
-            help="If empty, all Nifty 500 names are analyzed. If set, only these tickers.",
+        sym_set = set(sym_list)
+
+        if STOCK_PICK_KEY not in st.session_state:
+            st.session_state[STOCK_PICK_KEY] = list(sym_list)
+        else:
+            st.session_state[STOCK_PICK_KEY] = [s for s in st.session_state[STOCK_PICK_KEY] if s in sym_set]
+
+        st.markdown("**Stocks**")
+        ba1, ba2 = st.columns(2)
+        with ba1:
+            if st.button("Select all", use_container_width=True, key="btn_stocks_all"):
+                st.session_state[STOCK_PICK_KEY] = list(sym_list)
+                st.rerun()
+        with ba2:
+            if st.button("Clear all", use_container_width=True, key="btn_stocks_none"):
+                st.session_state[STOCK_PICK_KEY] = []
+                st.rerun()
+
+        st.multiselect(
+            "Search & pick tickers (Yahoo `.NS`)",
+            options=sym_list,
+            key=STOCK_PICK_KEY,
+            placeholder="Type to filter, then tick choices",
+            help="All names are selected by default. Remove tickers to narrow the run. "
+            "Use **Clear all** / **Select all** for bulk changes.",
         )
-        override_syms = _parse_override_symbols(override_raw)
-        symbols = override_syms if override_syms else sym_list
+        if not st.session_state[STOCK_PICK_KEY]:
+            st.caption("_Select at least one ticker before running analysis._")
 
         today = date.today()
         start_d = st.date_input("Start date", value=today - timedelta(days=30))
@@ -265,6 +283,11 @@ def main() -> None:
 
     if not run:
         st.info("Set parameters in the sidebar and click **Run analysis**.")
+        return
+
+    symbols = list(st.session_state.get(STOCK_PICK_KEY, []))
+    if not symbols:
+        st.error("Select at least one stock in the sidebar, or click **Select all**.")
         return
 
     n_sym = len(symbols)
@@ -374,8 +397,8 @@ def main() -> None:
     with tab2:
         if len(symbols) != 1:
             st.info(
-                "Candle + RSI charts are available when exactly **one** symbol is analyzed "
-                "(use override with a single ticker)."
+                "Candle + RSI charts are available when exactly **one** symbol is selected "
+                "in the sidebar stocks list."
             )
         else:
             sym = symbols[0]
@@ -446,6 +469,7 @@ def main() -> None:
 
 **UI**
 
+- Choose symbols with the sidebar **multiselect** (type to filter the list). **Select all** / **Clear all** for bulk selection.
 - Last-candle columns are omitted from on-screen tables (logic still uses them internally).
 
 **Disclaimer:** Educational / research use only; not investment advice.
