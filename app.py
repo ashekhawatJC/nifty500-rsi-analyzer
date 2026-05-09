@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -95,8 +95,12 @@ def _analyze_single_stock(
     rsi_period: int,
     max_gain_pct: float,
     success_min_pct: float,
+    *,
+    fetch_inter_chunk_delay: float,
+    fetch_rate_limit_retries: int,
+    fetch_rate_limit_base_delay: float,
 ) -> dict:
-    """Fetch + RSI + triplets + filters. Thread-safe for I/O-bound Yahoo calls."""
+    """Fetch + RSI + triplets + filters (sequential Yahoo pacing in caller)."""
     out: dict = {
         "symbol": symbol,
         "error": None,
@@ -113,7 +117,15 @@ def _analyze_single_stock(
         "show": False,
     }
     try:
-        df, meta = fetch_ohlcv(symbol, start_d, end_d, int(candle_mins))
+        df, meta = fetch_ohlcv(
+            symbol,
+            start_d,
+            end_d,
+            int(candle_mins),
+            inter_chunk_delay_sec=float(fetch_inter_chunk_delay),
+            rate_limit_retries=int(fetch_rate_limit_retries),
+            rate_limit_base_delay_sec=float(fetch_rate_limit_base_delay),
+        )
         out["warning"] = meta.warning
         out["interval"] = meta.interval
         out["chunks"] = meta.chunks_fetched
@@ -201,8 +213,10 @@ def main() -> None:
             max_value=1000.0,
             value=0.0,
             step=0.1,
-            help="Rows with gain_percentage ≥ this value are shown in **dark green** text in the table.",
-            "Same value is used inside success-rate M = count(gain% > this).",
+            help=(
+                "Rows with gain_percentage ≥ this value use **dark green** text. "
+                "Same value defines success-rate M = count(gain% > this), strict."
+            ),
         )
         success_min_pct = st.number_input(
             "Minimum stock success rate %",
@@ -213,12 +227,39 @@ def main() -> None:
             help="Show the full excursion table for a stock only if its success rate ≥ this. "
             "Success % = (M / N)×100 with N=all excursions, M=count with gain% > max gain %.",
         )
-        workers = st.slider(
-            "Parallel download workers",
+        st.subheader("Yahoo pacing")
+        st.caption("Parallel workers were removed — Yahoo **429** throttling is much worse with bursts.")
+        symbol_pause_sec = st.slider(
+            "Pause between symbols (sec)",
+            min_value=0.0,
+            max_value=5.0,
+            value=1.2,
+            step=0.1,
+            help="Wait after each symbol before the next HTTP sequence. Use ~1–2s for full Nifty 500.",
+        )
+        inter_chunk_sec = st.slider(
+            "Pause between date chunks (sec)",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.4,
+            step=0.05,
+            help="Extra delay between Yahoo `history()` calls for the same symbol (multi-chunk ranges).",
+        )
+        rate_retries = st.number_input(
+            "429 / rate-limit retries per request",
             min_value=1,
             max_value=12,
-            value=5,
-            help="Higher = faster but more risk of Yahoo throttling.",
+            value=6,
+            step=1,
+            help="How many times to retry one chunk after Too Many Requests before failing the symbol.",
+        )
+        rate_base_delay = st.slider(
+            "First retry wait (sec)",
+            min_value=0.5,
+            max_value=15.0,
+            value=2.5,
+            step=0.5,
+            help="Initial backoff; doubles with jitter on each retry (capped).",
         )
         run = st.button("Run analysis", type="primary")
 
@@ -228,33 +269,33 @@ def main() -> None:
 
     n_sym = len(symbols)
     st.caption(
-        f"Analyzing **{n_sym}** symbol(s). "
-        f"Intraday history is fetched in **calendar chunks** per symbol to reduce truncation."
+        f"Analyzing **{n_sym}** symbol(s) **one at a time** with pacing (reduces Yahoo 429s). "
+        f"Intraday history uses **chunked** windows per symbol."
     )
     prog = st.progress(0.0, text="Starting…")
     results: list[dict] = []
     done = 0
 
-    max_w = max(1, min(int(workers), n_sym))
-
-    def _one(sym: str) -> dict:
-        return _analyze_single_stock(
-            sym,
-            start_d,
-            end_d,
-            int(candle_mins),
-            float(threshold),
-            int(rsi_period),
-            float(max_gain_pct),
-            float(success_min_pct),
+    for i, sym in enumerate(symbols):
+        results.append(
+            _analyze_single_stock(
+                sym,
+                start_d,
+                end_d,
+                int(candle_mins),
+                float(threshold),
+                int(rsi_period),
+                float(max_gain_pct),
+                float(success_min_pct),
+                fetch_inter_chunk_delay=float(inter_chunk_sec),
+                fetch_rate_limit_retries=int(rate_retries),
+                fetch_rate_limit_base_delay=float(rate_base_delay),
+            )
         )
-
-    with ThreadPoolExecutor(max_workers=max_w) as ex:
-        futs = {ex.submit(_one, s): s for s in symbols}
-        for fut in as_completed(futs):
-            results.append(fut.result())
-            done += 1
-            prog.progress(done / max(n_sym, 1), text=f"Completed {done}/{n_sym}…")
+        done += 1
+        prog.progress(done / max(n_sym, 1), text=f"Completed {done}/{n_sym}…")
+        if float(symbol_pause_sec) > 0 and i < n_sym - 1:
+            time.sleep(float(symbol_pause_sec))
 
     prog.empty()
 
@@ -377,6 +418,7 @@ def main() -> None:
 - Each symbol’s intraday range is downloaded in **multiple calendar windows** (chunks), then merged.
 - This reduces **silent truncation** from asking Yahoo for one very long intraday span in a single call.
 - Yahoo can still omit data outside its published intraday depth; widen the interval or shorten dates if bars are missing.
+- **Rate limits (429):** symbols are fetched **sequentially** with pauses between symbols and between chunks; failed chunks **retry** with exponential backoff. For large batches, use **1–2 s** between symbols and avoid many parallel browser tabs hitting Yahoo at the same time.
 
 **RSI excursions**
 

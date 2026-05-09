@@ -1,7 +1,9 @@
-"""Yahoo Finance OHLCV fetch with interval mapping, range limits, and date chunking."""
+"""Yahoo Finance OHLCV fetch with interval mapping, range limits, chunking, and rate-limit retries."""
 
 from __future__ import annotations
 
+import random
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import List, Optional, Tuple
@@ -80,6 +82,15 @@ def _chunk_span_days(interval_mins: int) -> int:
     return 55
 
 
+def _is_rate_limited(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "too many requests" in msg
+        or "rate limit" in msg
+        or "429" in msg
+    )
+
+
 def _fetch_raw(
     symbol: str,
     start: date,
@@ -117,6 +128,28 @@ def _fetch_raw(
     return df
 
 
+def _fetch_raw_with_retry(
+    symbol: str,
+    start: date,
+    end: date,
+    yf_interval: str,
+    *,
+    auto_adjust: bool = False,
+    max_retries: int = 6,
+    base_delay_sec: float = 2.0,
+) -> pd.DataFrame:
+    """Call Yahoo with exponential backoff on HTTP 429 / rate-limit style errors."""
+    delay = float(base_delay_sec)
+    for attempt in range(max(1, int(max_retries))):
+        try:
+            return _fetch_raw(symbol, start, end, yf_interval, auto_adjust=auto_adjust)
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= max_retries - 1 or not _is_rate_limited(exc):
+                raise
+            time.sleep(delay + random.uniform(0.0, 0.4))
+            delay = min(delay * 1.85, 60.0)
+
+
 def _merge_chunk_frames(parts: List[pd.DataFrame]) -> pd.DataFrame:
     if not parts:
         return pd.DataFrame()
@@ -133,12 +166,18 @@ def fetch_ohlcv(
     interval_mins: int,
     *,
     auto_adjust: bool = False,
+    inter_chunk_delay_sec: float = 0.35,
+    rate_limit_retries: int = 6,
+    rate_limit_base_delay_sec: float = 2.0,
 ) -> Tuple[pd.DataFrame, FetchMeta]:
     """
     OHLCV indexed by candle start. For 240m, downloads 60m (chunked) then resamples.
 
     Intraday pulls are **chunked by calendar window** and concatenated so we are less
     likely to miss bars that a single long `history()` call would truncate.
+
+    ``inter_chunk_delay_sec`` adds a short pause between chunk HTTP calls (reduces 429s).
+    ``rate_limit_*`` controls retries with backoff when Yahoo returns rate limits.
     """
     warn = validate_intraday_range(start, end, interval_mins)
     yf_iv = minutes_to_yf_interval(interval_mins)
@@ -146,10 +185,21 @@ def fetch_ohlcv(
     windows = _calendar_chunks(start, end, span)
 
     parts: List[pd.DataFrame] = []
-    for ws, we in windows:
-        part = _fetch_raw(symbol, ws, we, yf_iv, auto_adjust=auto_adjust)
+    n_win = len(windows)
+    for j, (ws, we) in enumerate(windows):
+        part = _fetch_raw_with_retry(
+            symbol,
+            ws,
+            we,
+            yf_iv,
+            auto_adjust=auto_adjust,
+            max_retries=rate_limit_retries,
+            base_delay_sec=rate_limit_base_delay_sec,
+        )
         if not part.empty:
             parts.append(part)
+        if inter_chunk_delay_sec > 0 and j < n_win - 1:
+            time.sleep(float(inter_chunk_delay_sec))
 
     df = _merge_chunk_frames(parts)
 
@@ -157,6 +207,6 @@ def fetch_ohlcv(
         df = resample_ohlcv_minutes(df, 240)
         meta_iv = "240m (resampled from 60m Yahoo bars, chunked fetch)"
     else:
-        meta_iv = yf_iv + (" (chunked fetch)" if len(windows) > 1 else "")
+        meta_iv = yf_iv + (" (chunked fetch)" if n_win > 1 else "")
 
-    return df, FetchMeta(interval=meta_iv, warning=warn, chunks_fetched=len(windows))
+    return df, FetchMeta(interval=meta_iv, warning=warn, chunks_fetched=n_win)
