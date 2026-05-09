@@ -70,11 +70,7 @@ def find_rsi_threshold_triplets(
     work = add_candle_bounds(df, interval_mins)
     work["rsi"] = rsi
 
-    idx_list = work.index.tolist()
     r = work["rsi"].to_numpy()
-    high = work["high"].to_numpy()
-    c_start = work["candle_start"].to_numpy()
-    c_end = work["candle_end"].to_numpy()
 
     triplets: List[Triplet] = []
     state = "seek_up"
